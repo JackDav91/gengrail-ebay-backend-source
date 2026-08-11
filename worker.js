@@ -439,12 +439,15 @@ async function handleResolveListing(request, env) {
 async function handleUploadImage(request, env) {
   let payload;
   try {
-    payload = await request.json();
-  } catch {
+    const raw = await request.text();
+    if (!raw) throw new Error("empty request body");
+    payload = JSON.parse(raw);
+  } catch (err) {
     return json({
       ok:false,
       error:"invalid_image_payload",
-      message:"The Gengrail image bridge could not read the image payload."
+      message:"The Gengrail image bridge could not read the image payload.",
+      detail:String(err?.message || err || "unknown parse error")
     }, 400);
   }
 
@@ -472,7 +475,7 @@ async function handleUploadImage(request, env) {
   const image = new File([bytes], filename, { type: contentType });
 
   // eBay receives the exact multipart/form-data upload it requires.
-  const token = await getAppAccessToken(env);
+  const token = await getAccessToken(env);
   const form = new FormData();
   form.set("image", image, filename);
 
