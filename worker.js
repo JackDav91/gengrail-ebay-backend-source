@@ -385,60 +385,308 @@ async function handleCreateInventoryLocation(request, env) {
     ebay.ok ? 200 : ebay.status || 502);
 }
 
+
+function normaliseText(value = "") {
+  return String(value || "").trim().toLowerCase();
+}
+
+function descriptorValueName(value) {
+  // Current Metadata API documentation uses conditionDescriptorValueName.
+  // Keep the older alias too so the resolver is tolerant of response variations.
+  return String(
+    value?.conditionDescriptorValueName ??
+    value?.conditionDescriptorValue ??
+    ""
+  );
+}
+
+function conditionTarget(conditionApi = "USED_VERY_GOOD") {
+  const api = String(conditionApi || "USED_VERY_GOOD").toUpperCase();
+
+  if (api === "LIKE_NEW") {
+    return {
+      api,
+      conditionId: "2750",
+      graded: true
+    };
+  }
+
+  if (api === "NEW") {
+    return {
+      api,
+      conditionId: "1000",
+      graded: false
+    };
+  }
+
+  // eBay uses USED_VERY_GOOD / condition ID 4000 as the umbrella
+  // Inventory API condition for ungraded trading cards. The actual card
+  // condition is then supplied through the Card Condition descriptor.
+  return {
+    api: "USED_VERY_GOOD",
+    conditionId: "4000",
+    graded: false
+  };
+}
+
+function resolveConditionMetadata(conditionPolicy, conditionApi) {
+  const target = conditionTarget(conditionApi);
+  const itemConditions = Array.isArray(conditionPolicy?.itemConditions)
+    ? conditionPolicy.itemConditions
+    : [];
+
+  const itemCondition =
+    itemConditions.find(c => String(c?.conditionId || "") === target.conditionId) ||
+    null;
+
+  if (!itemCondition) {
+    return {
+      conditionApi: target.api,
+      conditionId: target.conditionId,
+      itemConditionFound: false,
+      descriptorRequired: target.api !== "NEW",
+      descriptorNameId: "",
+      descriptorName: "",
+      descriptorValueId: "",
+      descriptorValue: "",
+      graded: target.graded,
+      message: "eBay did not return the expected item condition for this category."
+    };
+  }
+
+  const descriptors = Array.isArray(itemCondition?.conditionDescriptors)
+    ? itemCondition.conditionDescriptors
+    : [];
+
+  if (target.api === "NEW") {
+    return {
+      conditionApi: target.api,
+      conditionId: String(itemCondition.conditionId || target.conditionId),
+      itemConditionFound: true,
+      descriptorRequired: false,
+      descriptorNameId: "",
+      descriptorName: "",
+      descriptorValueId: "",
+      descriptorValue: "",
+      graded: false,
+      message: "New condition resolved; no trading-card condition descriptor is required."
+    };
+  }
+
+  if (target.graded) {
+    return {
+      conditionApi: target.api,
+      conditionId: String(itemCondition.conditionId || target.conditionId),
+      itemConditionFound: true,
+      descriptorRequired: true,
+      descriptorNameId: "",
+      descriptorName: "",
+      descriptorValueId: "",
+      descriptorValue: "",
+      graded: true,
+      requiredDescriptors: descriptors.map(d => ({
+        id: String(d?.conditionDescriptorId || ""),
+        name: String(d?.conditionDescriptorName || ""),
+        usage: String(d?.conditionDescriptorConstraint?.usage || ""),
+        values: (Array.isArray(d?.conditionDescriptorValues) ? d.conditionDescriptorValues : []).map(v => ({
+          id: String(v?.conditionDescriptorValueId || ""),
+          value: descriptorValueName(v)
+        }))
+      })),
+      message: "Graded card detected. Grader and Grade must be supplied before publishing."
+    };
+  }
+
+  // Ungraded trading cards require the Card Condition descriptor (ID 40001).
+  const descriptor =
+    descriptors.find(d => String(d?.conditionDescriptorId || "") === "40001") ||
+    descriptors.find(d => normaliseText(d?.conditionDescriptorName) === "card condition") ||
+    descriptors.find(d => normaliseText(d?.conditionDescriptorHelpText).includes("ungraded")) ||
+    null;
+
+  if (!descriptor) {
+    return {
+      conditionApi: target.api,
+      conditionId: String(itemCondition.conditionId || target.conditionId),
+      itemConditionFound: true,
+      descriptorRequired: true,
+      descriptorNameId: "",
+      descriptorName: "",
+      descriptorValueId: "",
+      descriptorValue: "",
+      graded: false,
+      message: "Card Condition descriptor was not returned for this category."
+    };
+  }
+
+  const values = Array.isArray(descriptor?.conditionDescriptorValues)
+    ? descriptor.conditionDescriptorValues
+    : [];
+
+  // Do not confuse the umbrella API enum USED_VERY_GOOD with a literal
+  // "Very Good" descriptor. For CCG Individual Cards (183454), eBay's
+  // permitted ungraded values are category-specific. Prefer eBay's own
+  // defaultConditionDescriptorValueId; if absent, prefer Near Mint or Better,
+  // then the first permitted value.
+  const defaultValueId = String(
+    descriptor?.conditionDescriptorConstraint?.defaultConditionDescriptorValueId || ""
+  );
+
+  const resolvedValue =
+    (defaultValueId
+      ? values.find(v => String(v?.conditionDescriptorValueId || "") === defaultValueId)
+      : null) ||
+    values.find(v => normaliseText(descriptorValueName(v)) === "near mint or better") ||
+    values[0] ||
+    null;
+
+  return {
+    conditionApi: target.api,
+    conditionId: String(itemCondition.conditionId || target.conditionId),
+    itemConditionFound: true,
+    descriptorRequired: true,
+    descriptorNameId: String(descriptor?.conditionDescriptorId || ""),
+    descriptorName: String(descriptor?.conditionDescriptorName || ""),
+    descriptorValueId: String(resolvedValue?.conditionDescriptorValueId || ""),
+    descriptorValue: descriptorValueName(resolvedValue),
+    graded: false,
+    availableDescriptorValues: values.map(v => ({
+      id: String(v?.conditionDescriptorValueId || ""),
+      value: descriptorValueName(v)
+    })),
+    message: resolvedValue
+      ? "Ungraded trading-card condition descriptor resolved from live eBay metadata."
+      : "Card Condition was found, but eBay returned no usable descriptor value."
+  };
+}
+
 async function handleResolveListing(request, env) {
   const url = new URL(request.url);
   const marketplace = String(url.searchParams.get("marketplace_id") || "EBAY_GB").trim();
   const q = String(url.searchParams.get("q") || "").trim();
-  if (!q) return json({ ok: false, error: "query_required", message: "q is required." }, 400);
+  const conditionApi = String(url.searchParams.get("condition_api") || "USED_VERY_GOOD").trim();
 
-  const tree = await taxonomyFetch(env, "/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=" + encodeURIComponent(marketplace));
+  if (!q) {
+    return json({ ok: false, error: "query_required", message: "q is required." }, 400);
+  }
+
+  const tree = await taxonomyFetch(
+    env,
+    "/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=" +
+      encodeURIComponent(marketplace)
+  );
   const treeId = String(tree?.categoryTreeId || "");
-  if (!treeId) throw new Error("eBay did not return a category tree ID for " + marketplace + ".");
+  if (!treeId) {
+    throw new Error("eBay did not return a category tree ID for " + marketplace + ".");
+  }
 
   const suggestionsPayload = await taxonomyFetch(
     env,
-    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_category_suggestions?q=" + encodeURIComponent(q)
+    "/commerce/taxonomy/v1/category_tree/" +
+      encodeURIComponent(treeId) +
+      "/get_category_suggestions?q=" +
+      encodeURIComponent(q)
   );
-  const rawSuggestions = Array.isArray(suggestionsPayload?.categorySuggestions) ? suggestionsPayload.categorySuggestions : [];
+
+  const rawSuggestions = Array.isArray(suggestionsPayload?.categorySuggestions)
+    ? suggestionsPayload.categorySuggestions
+    : [];
+
   const suggestions = rawSuggestions.slice(0, 5).map(s => ({
     categoryId: String(s?.category?.categoryId || ""),
     categoryName: String(s?.category?.categoryName || ""),
     ancestors: Array.isArray(s?.categoryTreeNodeAncestors)
-      ? s.categoryTreeNodeAncestors.map(a => String(a?.categoryName || a?.category?.categoryName || "")).filter(Boolean)
+      ? s.categoryTreeNodeAncestors
+          .map(a => String(a?.categoryName || a?.category?.categoryName || ""))
+          .filter(Boolean)
       : []
   })).filter(s => s.categoryId);
+
   const category = suggestions[0] || null;
-  if (!category) return json({ ok: false, error: "no_category_suggestion", message: "eBay returned no category suggestion for this item.", query: q }, 422);
+  if (!category) {
+    return json({
+      ok: false,
+      error: "no_category_suggestion",
+      message: "eBay returned no category suggestion for this item.",
+      query: q
+    }, 422);
+  }
 
   const aspectPayload = await taxonomyFetch(
     env,
-    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_item_aspects_for_category?category_id=" + encodeURIComponent(category.categoryId)
+    "/commerce/taxonomy/v1/category_tree/" +
+      encodeURIComponent(treeId) +
+      "/get_item_aspects_for_category?category_id=" +
+      encodeURIComponent(category.categoryId)
   );
-  const allAspects = Array.isArray(aspectPayload?.aspects) ? aspectPayload.aspects : [];
-  const requiredAspects = allAspects.filter(a => a?.aspectConstraint?.aspectRequired === true).map(a => ({
-    name: String(a?.localizedAspectName || ""),
-    mode: String(a?.aspectConstraint?.aspectMode || ""),
-    values: Array.isArray(a?.aspectValues) ? a.aspectValues.slice(0, 100).map(v => String(v?.localizedValue || "")).filter(Boolean) : []
-  })).filter(a => a.name);
+
+  const allAspects = Array.isArray(aspectPayload?.aspects)
+    ? aspectPayload.aspects
+    : [];
+
+  const requiredAspects = allAspects
+    .filter(a => a?.aspectConstraint?.aspectRequired === true)
+    .map(a => ({
+      name: String(a?.localizedAspectName || ""),
+      mode: String(a?.aspectConstraint?.aspectMode || ""),
+      values: Array.isArray(a?.aspectValues)
+        ? a.aspectValues
+            .slice(0, 100)
+            .map(v => String(v?.localizedValue || ""))
+            .filter(Boolean)
+        : []
+    }))
+    .filter(a => a.name);
 
   const filter = encodeURIComponent("categoryIds:{" + category.categoryId + "}");
   const conditionResult = await ebayFetch(
     env,
-    "/sell/metadata/v1/marketplace/" + encodeURIComponent(marketplace) + "/get_item_condition_policies?filter=" + filter
+    "/sell/metadata/v1/marketplace/" +
+      encodeURIComponent(marketplace) +
+      "/get_item_condition_policies?filter=" +
+      filter
   );
-  const conditionPayload = conditionResult?.data || {};
-  const policies = Array.isArray(conditionPayload?.itemConditionPolicies) ? conditionPayload.itemConditionPolicies : [];
-  const conditionPolicy = policies.find(p => String(p?.categoryId || "") === category.categoryId) || policies[0] || null;
+
+  if (!conditionResult.ok) {
+    return json({
+      ok: false,
+      error: "condition_metadata_failed",
+      message: "eBay Metadata API did not return condition policy data.",
+      status: conditionResult.status,
+      data: conditionResult.data,
+      category
+    }, conditionResult.status || 502);
+  }
+
+  const conditionPayload = conditionResult.data || {};
+  const policies = Array.isArray(conditionPayload?.itemConditionPolicies)
+    ? conditionPayload.itemConditionPolicies
+    : [];
+
+  const conditionPolicy =
+    policies.find(p => String(p?.categoryId || "") === category.categoryId) ||
+    policies[0] ||
+    null;
+
+  const condition = resolveConditionMetadata(conditionPolicy, conditionApi);
 
   return json({
     ok: true,
+    engine: "gengrail-listing-resolver-v2",
     marketplace,
     query: q,
     categoryTreeId: treeId,
     category,
     suggestions,
     requiredAspects,
-    conditionPolicy
+    condition,
+    ready: Boolean(
+      category.categoryId &&
+      (
+        condition.descriptorRequired === false ||
+        (condition.descriptorNameId && condition.descriptorValueId)
+      )
+    )
   });
 }
 
@@ -807,7 +1055,7 @@ export default {
           ok: true,
           service: "Gengrail eBay Production Backend",
           environment: "production",
-          build: "v19.3.8-ebay-gb-language-header"
+          build: "v19.4.3-condition-descriptor-resolver-v2"
         });
       } else if (url.pathname === "/oauth/start" && request.method === "GET") {
         // Navigation endpoint: no CORS needed for the redirect itself.
