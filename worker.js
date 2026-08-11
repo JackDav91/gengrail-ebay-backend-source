@@ -1,0 +1,509 @@
+/*
+  Gengrail TCG — eBay Production OAuth backend
+  Cloudflare Worker + Workers KV
+
+  Secrets:
+    EBAY_CLIENT_SECRET  -> Cloudflare secret (NEVER commit)
+
+  Variables:
+    EBAY_CLIENT_ID      -> Sandbox App ID / Client ID
+    EBAY_RUNAME         -> Sandbox OAuth-enabled RuName
+    APP_URL             -> https://jackdav91.github.io/gengrail-business-log/
+    APP_ORIGIN          -> https://jackdav91.github.io
+
+  KV binding:
+    EBAY_AUTH
+*/
+
+const EBAY_AUTH_URL = "https://auth.ebay.com/oauth2/authorize";
+const EBAY_API = "https://api.ebay.com";
+const TOKEN_URL = EBAY_API + "/identity/v1/oauth2/token";
+
+const SCOPES = [
+  "https://api.ebay.com/oauth/api_scope/sell.account",
+  "https://api.ebay.com/oauth/api_scope/sell.inventory",
+  "https://api.ebay.com/oauth/api_scope/sell.fulfillment"
+];
+
+const TOKEN_KEY = "production:ebay_tokens";
+
+function json(data, status = 200, extra = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...extra
+    }
+  });
+}
+
+function corsHeaders(env) {
+  return {
+    "access-control-allow-origin": env.APP_ORIGIN,
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400",
+    "vary": "Origin"
+  };
+}
+
+function withCors(response, env) {
+  const headers = new Headers(response.headers);
+  const cors = corsHeaders(env);
+  Object.entries(cors).forEach(([k, v]) => headers.set(k, v));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function requireConfig(env) {
+  const missing = [];
+  for (const key of ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "EBAY_RUNAME", "APP_URL", "APP_ORIGIN"]) {
+    if (!env[key]) missing.push(key);
+  }
+  if (!env.EBAY_AUTH) missing.push("EBAY_AUTH (KV binding)");
+  return missing;
+}
+
+function randomState() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function readTokens(env) {
+  const raw = await env.EBAY_AUTH.get(TOKEN_KEY);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function writeTokens(env, tokenResponse) {
+  const now = Date.now();
+  const existing = await readTokens(env);
+  const record = {
+    access_token: tokenResponse.access_token || existing?.access_token || "",
+    access_expires_at: tokenResponse.expires_in
+      ? now + (Number(tokenResponse.expires_in) * 1000)
+      : existing?.access_expires_at || 0,
+    refresh_token: tokenResponse.refresh_token || existing?.refresh_token || "",
+    refresh_expires_at: tokenResponse.refresh_token_expires_in
+      ? now + (Number(tokenResponse.refresh_token_expires_in) * 1000)
+      : existing?.refresh_expires_at || 0,
+    scope: tokenResponse.scope || existing?.scope || SCOPES.join(" "),
+    token_type: tokenResponse.token_type || existing?.token_type || "User Access Token",
+    updated_at: new Date(now).toISOString()
+  };
+  await env.EBAY_AUTH.put(TOKEN_KEY, JSON.stringify(record));
+  return record;
+}
+
+function basicAuth(env) {
+  return "Basic " + btoa(env.EBAY_CLIENT_ID + ":" + env.EBAY_CLIENT_SECRET);
+}
+
+async function exchangeCode(env, code) {
+  const body = new URLSearchParams();
+  body.set("grant_type", "authorization_code");
+  body.set("code", code);
+  body.set("redirect_uri", env.EBAY_RUNAME);
+
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "authorization": basicAuth(env)
+    },
+    body
+  });
+
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) {
+    throw new Error("eBay token exchange failed (" + res.status + "): " + JSON.stringify(data));
+  }
+  return data;
+}
+
+async function refreshAccessToken(env, refreshToken) {
+  const body = new URLSearchParams();
+  body.set("grant_type", "refresh_token");
+  body.set("refresh_token", refreshToken);
+  body.set("scope", SCOPES.join(" "));
+
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "authorization": basicAuth(env)
+    },
+    body
+  });
+
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) {
+    throw new Error("eBay token refresh failed (" + res.status + "): " + JSON.stringify(data));
+  }
+  return data;
+}
+
+async function getAccessToken(env) {
+  let tokens = await readTokens(env);
+  if (!tokens?.refresh_token) throw new Error("eBay is not connected yet.");
+
+  // Keep a 2-minute safety margin.
+  if (tokens.access_token && Number(tokens.access_expires_at || 0) > Date.now() + 120000) {
+    return tokens.access_token;
+  }
+
+  const refreshed = await refreshAccessToken(env, tokens.refresh_token);
+  tokens = await writeTokens(env, refreshed);
+  return tokens.access_token;
+}
+
+async function getAppAccessToken(env) {
+  const cacheKey = "production:ebay_app_token";
+  try {
+    const cached = await env.EBAY_AUTH.get(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed?.access_token && Number(parsed.expires_at || 0) > Date.now() + 12e4) return parsed.access_token;
+    }
+  } catch {}
+  const body = new URLSearchParams();
+  body.set("grant_type", "client_credentials");
+  body.set("scope", "https://api.ebay.com/oauth/api_scope");
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "authorization": basicAuth(env)
+    },
+    body
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error("eBay app token failed (" + res.status + "): " + JSON.stringify(data));
+  const record = {
+    access_token: data.access_token,
+    expires_at: Date.now() + Number(data.expires_in || 7200) * 1000
+  };
+  await env.EBAY_AUTH.put(cacheKey, JSON.stringify(record), { expirationTtl: Math.max(60, Number(data.expires_in || 7200) - 60) });
+  return record.access_token;
+}
+__name(getAppAccessToken, "getAppAccessToken");
+
+async function taxonomyFetch(env, path) {
+  const token = await getAppAccessToken(env);
+  const res = await fetch(EBAY_API + path, {
+    method: "GET",
+    headers: { "authorization": "Bearer " + token, "accept": "application/json" }
+  });
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
+  if (!res.ok) throw new Error("eBay Taxonomy API failed (" + res.status + "): " + JSON.stringify(data));
+  return data;
+}
+__name(taxonomyFetch, "taxonomyFetch");
+
+async function ebayFetch(env, path, options = {}) {
+  const accessToken = await getAccessToken(env);
+  const headers = new Headers(options.headers || {});
+  headers.set("authorization", "Bearer " + accessToken);
+  headers.set("accept", "application/json");
+  if (options.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+
+  const res = await fetch(EBAY_API + path, {
+    ...options,
+    headers
+  });
+
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  }
+  return { ok: res.ok, status: res.status, data, headers: res.headers };
+}
+
+async function handleStart(request, env) {
+  const state = randomState();
+  await env.EBAY_AUTH.put("production:state:" + state, "1", { expirationTtl: 600 });
+
+  const url = new URL(EBAY_AUTH_URL);
+  url.searchParams.set("client_id", env.EBAY_CLIENT_ID);
+  url.searchParams.set("redirect_uri", env.EBAY_RUNAME);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", SCOPES.join(" "));
+  url.searchParams.set("state", state);
+
+  return Response.redirect(url.toString(), 302);
+}
+
+async function handleCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const error = url.searchParams.get("error");
+  const errorDescription = url.searchParams.get("error_description");
+
+  if (error) {
+    const declined = new URL("ebay-declined.html", env.APP_URL);
+    declined.searchParams.set("reason", errorDescription || error);
+    return Response.redirect(declined.toString(), 302);
+  }
+
+  if (!code || !state) {
+    return json({
+      ok: false,
+      error: "missing_oauth_parameters",
+      message: "eBay did not return both code and state."
+    }, 400);
+  }
+
+  const savedState = await env.EBAY_AUTH.get("production:state:" + state);
+  if (!savedState) {
+    return json({
+      ok: false,
+      error: "invalid_state",
+      message: "OAuth state is missing, invalid or expired."
+    }, 400);
+  }
+  await env.EBAY_AUTH.delete("production:state:" + state);
+
+  try {
+    const tokenResponse = await exchangeCode(env, code);
+    await writeTokens(env, tokenResponse);
+
+    const success = new URL(env.APP_URL);
+    success.searchParams.set("ebay", "connected");
+    return Response.redirect(success.toString(), 302);
+  } catch (err) {
+    return json({
+      ok: false,
+      error: "token_exchange_failed",
+      message: String(err?.message || err)
+    }, 502);
+  }
+}
+
+async function handleStatus(env) {
+  const tokens = await readTokens(env);
+  if (!tokens?.refresh_token) {
+    return json({
+      ok: true,
+      environment: "production",
+      connected: false
+    });
+  }
+
+  return json({
+    ok: true,
+    environment: "production",
+    connected: true,
+    accessTokenUsable: Number(tokens.access_expires_at || 0) > Date.now() + 120000,
+    accessExpiresAt: tokens.access_expires_at ? new Date(tokens.access_expires_at).toISOString() : null,
+    refreshExpiresAt: tokens.refresh_expires_at ? new Date(tokens.refresh_expires_at).toISOString() : null,
+    updatedAt: tokens.updated_at || null,
+    scopes: SCOPES
+  });
+}
+
+async function handleDisconnect(env) {
+  await env.EBAY_AUTH.delete(TOKEN_KEY);
+  return json({ ok: true, connected: false });
+}
+
+async function handlePolicies(env) {
+  const marketplace = "EBAY_GB";
+  const [payment, fulfillment, returns] = await Promise.all([
+    ebayFetch(env, "/sell/account/v1/payment_policy?marketplace_id=" + marketplace),
+    ebayFetch(env, "/sell/account/v1/fulfillment_policy?marketplace_id=" + marketplace),
+    ebayFetch(env, "/sell/account/v1/return_policy?marketplace_id=" + marketplace)
+  ]);
+
+  return json({
+    ok: payment.ok && fulfillment.ok && returns.ok,
+    marketplace,
+    payment: { status: payment.status, data: payment.data },
+    fulfillment: { status: fulfillment.status, data: fulfillment.data },
+    returns: { status: returns.status, data: returns.data }
+  }, payment.ok && fulfillment.ok && returns.ok ? 200 : 502);
+}
+
+async function handleInventoryLocations(env) {
+  const ebay = await ebayFetch(env, "/sell/inventory/v1/location?limit=100");
+  return json({ ok: ebay.ok, status: ebay.status, data: ebay.data },
+    ebay.ok ? 200 : ebay.status || 502);
+}
+
+async function handleCreateInventoryLocation(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch {
+    return json({ ok:false, error:"invalid_json", message:"Request body must be valid JSON." }, 400);
+  }
+
+  const merchantLocationKey = String(body?.merchantLocationKey || "").trim();
+  if (!merchantLocationKey) {
+    return json({ ok:false, error:"merchant_location_key_required", message:"merchantLocationKey is required." }, 400);
+  }
+  if (!body?.location || typeof body.location !== "object") {
+    return json({ ok:false, error:"location_required", message:"location is required." }, 400);
+  }
+
+  const payload = {
+    location: body.location,
+    locationTypes: Array.isArray(body.locationTypes) && body.locationTypes.length ? body.locationTypes : ["WAREHOUSE"],
+    name: String(body?.name || "Gengrail TCG"),
+    merchantLocationStatus: body?.merchantLocationStatus || "ENABLED"
+  };
+  if (body?.phone) payload.phone = String(body.phone);
+  if (body?.specialHours) payload.specialHours = body.specialHours;
+  if (body?.operatingHours) payload.operatingHours = body.operatingHours;
+
+  const ebay = await ebayFetch(env,
+    "/sell/inventory/v1/location/" + encodeURIComponent(merchantLocationKey),
+    { method:"POST", body:JSON.stringify(payload) });
+
+  return json({ ok:ebay.ok, status:ebay.status, merchantLocationKey, data:ebay.data },
+    ebay.ok ? 200 : ebay.status || 502);
+}
+
+async function handleResolveListing(request, env) {
+  const url = new URL(request.url);
+  const marketplace = String(url.searchParams.get("marketplace_id") || "EBAY_GB").trim();
+  const q = String(url.searchParams.get("q") || "").trim();
+  if (!q) return json({ ok: false, error: "query_required", message: "q is required." }, 400);
+
+  const tree = await taxonomyFetch(env, "/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=" + encodeURIComponent(marketplace));
+  const treeId = String(tree?.categoryTreeId || "");
+  if (!treeId) throw new Error("eBay did not return a category tree ID for " + marketplace + ".");
+
+  const suggestionsPayload = await taxonomyFetch(
+    env,
+    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_category_suggestions?q=" + encodeURIComponent(q)
+  );
+  const rawSuggestions = Array.isArray(suggestionsPayload?.categorySuggestions) ? suggestionsPayload.categorySuggestions : [];
+  const suggestions = rawSuggestions.slice(0, 5).map(s => ({
+    categoryId: String(s?.category?.categoryId || ""),
+    categoryName: String(s?.category?.categoryName || ""),
+    ancestors: Array.isArray(s?.categoryTreeNodeAncestors)
+      ? s.categoryTreeNodeAncestors.map(a => String(a?.categoryName || a?.category?.categoryName || "")).filter(Boolean)
+      : []
+  })).filter(s => s.categoryId);
+  const category = suggestions[0] || null;
+  if (!category) return json({ ok: false, error: "no_category_suggestion", message: "eBay returned no category suggestion for this item.", query: q }, 422);
+
+  const aspectPayload = await taxonomyFetch(
+    env,
+    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_item_aspects_for_category?category_id=" + encodeURIComponent(category.categoryId)
+  );
+  const allAspects = Array.isArray(aspectPayload?.aspects) ? aspectPayload.aspects : [];
+  const requiredAspects = allAspects.filter(a => a?.aspectConstraint?.aspectRequired === true).map(a => ({
+    name: String(a?.localizedAspectName || ""),
+    mode: String(a?.aspectConstraint?.aspectMode || ""),
+    values: Array.isArray(a?.aspectValues) ? a.aspectValues.slice(0, 100).map(v => String(v?.localizedValue || "")).filter(Boolean) : []
+  })).filter(a => a.name);
+
+  const filter = encodeURIComponent("categoryIds:{" + category.categoryId + "}");
+  const conditionResult = await ebayFetch(
+    env,
+    "/sell/metadata/v1/marketplace/" + encodeURIComponent(marketplace) + "/get_item_condition_policies?filter=" + filter
+  );
+  const conditionPayload = conditionResult?.data || {};
+  const policies = Array.isArray(conditionPayload?.itemConditionPolicies) ? conditionPayload.itemConditionPolicies : [];
+  const conditionPolicy = policies.find(p => String(p?.categoryId || "") === category.categoryId) || policies[0] || null;
+
+  return json({
+    ok: true,
+    marketplace,
+    query: q,
+    categoryTreeId: treeId,
+    category,
+    suggestions,
+    requiredAspects,
+    conditionPolicy
+  });
+}
+__name(handleResolveListing, "handleResolveListing");
+
+async function handleOrders(request, env) {
+  const url = new URL(request.url);
+  const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+  const ebay = await ebayFetch(env, "/sell/fulfillment/v1/order?limit=" + limit);
+  return json({
+    ok: ebay.ok,
+    status: ebay.status,
+    data: ebay.data
+  }, ebay.ok ? 200 : ebay.status || 502);
+}
+
+export default {
+  async fetch(request, env) {
+    const missing = requireConfig(env);
+    if (missing.length) {
+      return json({
+        ok: false,
+        error: "configuration_missing",
+        missing
+      }, 500);
+    }
+
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(env) });
+    }
+
+    try {
+      let response;
+
+      if (url.pathname === "/" || url.pathname === "/health") {
+        response = json({
+          ok: true,
+          service: "Gengrail eBay Production Backend",
+          environment: "production"
+        });
+      } else if (url.pathname === "/oauth/start" && request.method === "GET") {
+        // Navigation endpoint: no CORS needed for the redirect itself.
+        return handleStart(request, env);
+      } else if (url.pathname === "/ebay/callback" && request.method === "GET") {
+        return handleCallback(request, env);
+      } else if (url.pathname === "/api/ebay/status" && request.method === "GET") {
+        response = await handleStatus(env);
+      } else if (url.pathname === "/api/ebay/policies" && request.method === "GET") {
+        response = await handlePolicies(env);
+      } else if (url.pathname === "/api/ebay/resolve-listing" && request.method === "GET") {
+        response = await handleResolveListing(request, env);
+      } else if (url.pathname === "/api/ebay/inventory-locations" && request.method === "GET") {
+        response = await handleInventoryLocations(env);
+      } else if (url.pathname === "/api/ebay/inventory-location" && request.method === "POST") {
+        response = await handleCreateInventoryLocation(request, env);
+      } else if (url.pathname === "/api/ebay/orders" && request.method === "GET") {
+        response = await handleOrders(request, env);
+      } else if (url.pathname === "/api/ebay/disconnect" && request.method === "POST") {
+        response = await handleDisconnect(env);
+      } else {
+        response = json({ ok: false, error: "not_found" }, 404);
+      }
+
+      return withCors(response, env);
+    } catch (err) {
+      return withCors(json({
+        ok: false,
+        error: "worker_error",
+        message: String(err?.message || err)
+      }, 500), env);
+    }
+  }
+};
