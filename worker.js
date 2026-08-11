@@ -217,6 +217,13 @@ async function ebayFetch(env, path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("authorization", "Bearer " + accessToken);
   headers.set("accept", "application/json");
+
+  // eBay Inventory API requires a valid Content-Language when listing
+  // user-defined text. Gengrail is currently publishing to EBAY_GB.
+  if (!headers.has("content-language")) headers.set("content-language", "en-GB");
+  if (!headers.has("accept-language")) headers.set("accept-language", "en-GB");
+  if (!headers.has("x-ebay-c-marketplace-id")) headers.set("x-ebay-c-marketplace-id", "EBAY_GB");
+
   if (options.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
@@ -799,7 +806,8 @@ export default {
         response = json({
           ok: true,
           service: "Gengrail eBay Production Backend",
-          environment: "production"
+          environment: "production",
+          build: "v19.3.8-ebay-gb-language-header"
         });
       } else if (url.pathname === "/oauth/start" && request.method === "GET") {
         // Navigation endpoint: no CORS needed for the redirect itself.
