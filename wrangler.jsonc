@@ -2,6 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "gengrail-ebay-backend",
   "main": "worker.js",
-  "compatibility_date": "2026-08-11",
-  "keep_vars": true
+  "compatibility_date": "2026-08-10",
+  "keep_vars": true,
+  "kv_namespaces": [
+    {
+      "binding": "EBAY_AUTH",
+      "id": "07194b6d2c1245d4929fd9c0705682af"
+    }
+  ]
 }

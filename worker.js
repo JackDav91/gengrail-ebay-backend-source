@@ -197,7 +197,6 @@ async function getAppAccessToken(env) {
   await env.EBAY_AUTH.put(cacheKey, JSON.stringify(record), { expirationTtl: Math.max(60, Number(data.expires_in || 7200) - 60) });
   return record.access_token;
 }
-__name(getAppAccessToken, "getAppAccessToken");
 
 async function taxonomyFetch(env, path) {
   const token = await getAppAccessToken(env);
@@ -211,7 +210,6 @@ async function taxonomyFetch(env, path) {
   if (!res.ok) throw new Error("eBay Taxonomy API failed (" + res.status + "): " + JSON.stringify(data));
   return data;
 }
-__name(taxonomyFetch, "taxonomyFetch");
 
 async function ebayFetch(env, path, options = {}) {
   const accessToken = await getAccessToken(env);
@@ -435,7 +433,6 @@ async function handleResolveListing(request, env) {
     conditionPolicy
   });
 }
-__name(handleResolveListing, "handleResolveListing");
 
 async function handleOrders(request, env) {
   const url = new URL(request.url);
