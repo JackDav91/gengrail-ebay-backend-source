@@ -437,26 +437,41 @@ async function handleResolveListing(request, env) {
 
 
 async function handleUploadImage(request, env) {
-  const contentType = String(request.headers.get("content-type") || "").trim();
-  if (!contentType.startsWith("image/")) {
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
     return json({
       ok:false,
-      error:"invalid_image_type",
-      message:"The Gengrail image bridge expects a raw image request body."
+      error:"invalid_image_payload",
+      message:"The Gengrail image bridge could not read the image payload."
     }, 400);
   }
 
-  const bytes = await request.arrayBuffer();
-  if (!bytes || !bytes.byteLength) {
+  const filename = String(payload?.filename || "gengrail-card.jpg");
+  const contentType = String(payload?.contentType || "image/jpeg");
+  const dataBase64 = String(payload?.dataBase64 || "");
+
+  if (!dataBase64) {
     return json({ ok:false, error:"image_required", message:"The uploaded image was empty." }, 400);
   }
 
-  const filename = decodeURIComponent(String(request.headers.get("x-filename") || "gengrail-card.jpg"));
+  let bytes;
+  try {
+    const binary = atob(dataBase64);
+    bytes = new Uint8Array(binary.length);
+    for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+  } catch {
+    return json({ ok:false, error:"invalid_image_encoding", message:"The image could not be decoded." }, 400);
+  }
+
+  if (!bytes.byteLength) {
+    return json({ ok:false, error:"image_required", message:"The uploaded image was empty." }, 400);
+  }
+
   const image = new File([bytes], filename, { type: contentType });
 
-  // eBay Media API still receives proper multipart/form-data; only the
-  // browser -> Worker hop is raw binary so iOS/Cloudflare do not need to
-  // parse multipart form data first.
+  // eBay receives the exact multipart/form-data upload it requires.
   const token = await getAppAccessToken(env);
   const form = new FormData();
   form.set("image", image, filename);
