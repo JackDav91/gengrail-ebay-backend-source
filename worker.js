@@ -43,7 +43,7 @@ function corsHeaders(env) {
   return {
     "access-control-allow-origin": env.APP_ORIGIN,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type",
+    "access-control-allow-headers": "content-type,x-filename",
     "access-control-max-age": "86400",
     "vary": "Origin"
   };
@@ -437,26 +437,29 @@ async function handleResolveListing(request, env) {
 
 
 async function handleUploadImage(request, env) {
-  let incoming;
-  try {
-    incoming = await request.formData();
-  } catch {
-    return json({ ok:false, error:"invalid_form_data", message:"Image upload must use multipart/form-data." }, 400);
+  const contentType = String(request.headers.get("content-type") || "").trim();
+  if (!contentType.startsWith("image/")) {
+    return json({
+      ok:false,
+      error:"invalid_image_type",
+      message:"The Gengrail image bridge expects a raw image request body."
+    }, 400);
   }
 
-  const image = incoming.get("image");
-  if (!(image instanceof File)) {
-    return json({ ok:false, error:"image_required", message:"An image file is required." }, 400);
+  const bytes = await request.arrayBuffer();
+  if (!bytes || !bytes.byteLength) {
+    return json({ ok:false, error:"image_required", message:"The uploaded image was empty." }, 400);
   }
 
-  if (!String(image.type || "").startsWith("image/")) {
-    return json({ ok:false, error:"invalid_image_type", message:"The uploaded file is not an image." }, 400);
-  }
+  const filename = decodeURIComponent(String(request.headers.get("x-filename") || "gengrail-card.jpg"));
+  const image = new File([bytes], filename, { type: contentType });
 
-  // Media API image methods use the application access token.
+  // eBay Media API still receives proper multipart/form-data; only the
+  // browser -> Worker hop is raw binary so iOS/Cloudflare do not need to
+  // parse multipart form data first.
   const token = await getAppAccessToken(env);
   const form = new FormData();
-  form.set("image", image, image.name || "gengrail-card.jpg");
+  form.set("image", image, filename);
 
   const res = await fetch(EBAY_MEDIA_API + "/image/create_image_from_file", {
     method: "POST",
