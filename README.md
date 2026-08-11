@@ -16,3 +16,5 @@ Runtime secrets remain configured in Cloudflare under the Worker's **Settings â†
 `wrangler.jsonc` deliberately uses `keep_vars: true` so dashboard-managed runtime variables are retained on deploy.
 
 Version: Gengrail v19.3.3 Listing Resolver
+
+GitHub â†’ Cloudflare automatic deployment enabled.
