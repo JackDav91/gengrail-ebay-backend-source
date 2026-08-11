@@ -17,6 +17,7 @@
 
 const EBAY_AUTH_URL = "https://auth.ebay.com/oauth2/authorize";
 const EBAY_API = "https://api.ebay.com";
+const EBAY_MEDIA_API = "https://apim.ebay.com/commerce/media/v1_beta";
 const TOKEN_URL = EBAY_API + "/identity/v1/oauth2/token";
 
 const SCOPES = [
@@ -377,333 +378,368 @@ async function handleCreateInventoryLocation(request, env) {
     ebay.ok ? 200 : ebay.status || 502);
 }
 
-function normaliseText(value = "") {
-  return String(value || "").trim().toLowerCase();
-}
-
-function conditionTarget(conditionApi = "USED_VERY_GOOD") {
-  const api = String(conditionApi || "USED_VERY_GOOD").toUpperCase();
-  if (api === "LIKE_NEW") {
-    return {
-      api,
-      conditionId: "2750",
-      descriptorName: "",
-      descriptorValue: "",
-      graded: true
-    };
-  }
-  if (api === "NEW") {
-    return {
-      api,
-      conditionId: "1000",
-      descriptorName: "",
-      descriptorValue: "",
-      graded: false
-    };
-  }
-  return {
-    api: "USED_VERY_GOOD",
-    conditionId: "4000",
-    descriptorName: "Card Condition",
-    descriptorValue: "Very Good",
-    graded: false
-  };
-}
-
-function descriptorValues(descriptor) {
-  return Array.isArray(descriptor?.conditionDescriptorValues)
-    ? descriptor.conditionDescriptorValues
-    : [];
-}
-
-function resolveConditionMetadata(conditionPolicy, conditionApi) {
-  const target = conditionTarget(conditionApi);
-  const itemConditions = Array.isArray(conditionPolicy?.itemConditions)
-    ? conditionPolicy.itemConditions
-    : [];
-
-  const itemCondition =
-    itemConditions.find(c => String(c?.conditionId || "") === target.conditionId) ||
-    itemConditions.find(c => normaliseText(c?.conditionDescription).includes(
-      target.api === "USED_VERY_GOOD" ? "ungraded" :
-      target.api === "LIKE_NEW" ? "graded" : "new"
-    )) ||
-    null;
-
-  if (!itemCondition) {
-    return {
-      conditionApi: target.api,
-      conditionId: target.conditionId,
-      itemConditionFound: false,
-      descriptorRequired: target.api !== "NEW",
-      descriptorNameId: "",
-      descriptorName: "",
-      descriptorValueId: "",
-      descriptorValue: "",
-      graded: target.graded,
-      message: "eBay did not return the expected item condition for this category."
-    };
-  }
-
-  const descriptors = Array.isArray(itemCondition?.conditionDescriptors)
-    ? itemCondition.conditionDescriptors
-    : [];
-
-  // Graded cards need Grader + Grade. The current Gengrail V1 draft model
-  // only stores a single descriptor pair, so do not invent these values.
-  if (target.graded) {
-    return {
-      conditionApi: target.api,
-      conditionId: String(itemCondition.conditionId || target.conditionId),
-      itemConditionFound: true,
-      descriptorRequired: true,
-      graded: true,
-      descriptorNameId: "",
-      descriptorName: "",
-      descriptorValueId: "",
-      descriptorValue: "",
-      requiredDescriptors: descriptors.map(d => ({
-        id: String(d?.conditionDescriptorId || ""),
-        name: String(d?.conditionDescriptorName || ""),
-        usage: String(d?.conditionDescriptorConstraint?.usage || ""),
-        values: descriptorValues(d).map(v => ({
-          id: String(v?.conditionDescriptorValueId || ""),
-          value: String(v?.conditionDescriptorValue || "")
-        }))
-      })),
-      message: "Graded card detected. Grader and Grade must be supplied before publishing."
-    };
-  }
-
-  if (target.api === "NEW") {
-    return {
-      conditionApi: target.api,
-      conditionId: String(itemCondition.conditionId || target.conditionId),
-      itemConditionFound: true,
-      descriptorRequired: false,
-      graded: false,
-      descriptorNameId: "",
-      descriptorName: "",
-      descriptorValueId: "",
-      descriptorValue: "",
-      message: "New condition resolved; no trading-card condition descriptor is required."
-    };
-  }
-
-  const descriptor =
-    descriptors.find(d => normaliseText(d?.conditionDescriptorName) === normaliseText(target.descriptorName)) ||
-    descriptors.find(d => normaliseText(d?.conditionDescriptorHelpText).includes("ungraded")) ||
-    null;
-
-  if (!descriptor) {
-    return {
-      conditionApi: target.api,
-      conditionId: String(itemCondition.conditionId || target.conditionId),
-      itemConditionFound: true,
-      descriptorRequired: true,
-      graded: false,
-      descriptorNameId: "",
-      descriptorName: "",
-      descriptorValueId: "",
-      descriptorValue: "",
-      message: "Card Condition descriptor was not returned for this category."
-    };
-  }
-
-  const values = descriptorValues(descriptor);
-  const desired = normaliseText(target.descriptorValue);
-  const value =
-    values.find(v => normaliseText(v?.conditionDescriptorValue) === desired) ||
-    values.find(v => normaliseText(v?.conditionDescriptorValue).includes(desired)) ||
-    null;
-
-  const defaultValueId = String(
-    descriptor?.conditionDescriptorConstraint?.defaultConditionDescriptorValueId || ""
-  );
-
-  const resolvedValue =
-    value ||
-    (defaultValueId
-      ? values.find(v => String(v?.conditionDescriptorValueId || "") === defaultValueId)
-      : null) ||
-    null;
-
-  return {
-    conditionApi: target.api,
-    conditionId: String(itemCondition.conditionId || target.conditionId),
-    itemConditionFound: true,
-    descriptorRequired: true,
-    graded: false,
-    descriptorNameId: String(descriptor?.conditionDescriptorId || ""),
-    descriptorName: String(descriptor?.conditionDescriptorName || ""),
-    descriptorValueId: String(resolvedValue?.conditionDescriptorValueId || ""),
-    descriptorValue: String(resolvedValue?.conditionDescriptorValue || ""),
-    availableDescriptorValues: values.map(v => ({
-      id: String(v?.conditionDescriptorValueId || ""),
-      value: String(v?.conditionDescriptorValue || "")
-    })),
-    message: resolvedValue
-      ? "Trading-card condition descriptor resolved from live eBay metadata."
-      : "Card Condition was found, but eBay did not return a matching Very Good descriptor value."
-  };
-}
-
-function scoreCategorySuggestion(suggestion, query) {
-  const categoryName = normaliseText(suggestion?.categoryName);
-  const ancestors = Array.isArray(suggestion?.ancestors)
-    ? suggestion.ancestors.map(normaliseText)
-    : [];
-  const haystack = [categoryName, ...ancestors].join(" ");
-  const q = normaliseText(query);
-  let score = 0;
-
-  // eBay already ranks suggestions. These bonuses only protect trading-card
-  // searches from drifting into accessories, boxes, lots, or unrelated items.
-  if (haystack.includes("trading card")) score += 40;
-  if (haystack.includes("collectible card game") || haystack.includes("ccg")) score += 35;
-  if (categoryName.includes("individual") || categoryName.includes("single")) score += 25;
-  if (q.includes("pokemon") || q.includes("pokémon")) {
-    if (haystack.includes("pokemon") || haystack.includes("pokémon")) score += 30;
-  }
-  if (haystack.includes("accessor")) score -= 25;
-  if (haystack.includes("sealed")) score -= 15;
-  if (haystack.includes("box")) score -= 10;
-  if (haystack.includes("lot")) score -= 8;
-  return score;
-}
-
 async function handleResolveListing(request, env) {
   const url = new URL(request.url);
   const marketplace = String(url.searchParams.get("marketplace_id") || "EBAY_GB").trim();
   const q = String(url.searchParams.get("q") || "").trim();
-  const conditionApi = String(url.searchParams.get("condition_api") || "USED_VERY_GOOD").trim();
+  if (!q) return json({ ok: false, error: "query_required", message: "q is required." }, 400);
 
-  if (!q) {
-    return json({ ok: false, error: "query_required", message: "q is required." }, 400);
-  }
-
-  const tree = await taxonomyFetch(
-    env,
-    "/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=" +
-      encodeURIComponent(marketplace)
-  );
+  const tree = await taxonomyFetch(env, "/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=" + encodeURIComponent(marketplace));
   const treeId = String(tree?.categoryTreeId || "");
-  if (!treeId) {
-    throw new Error("eBay did not return a category tree ID for " + marketplace + ".");
-  }
+  if (!treeId) throw new Error("eBay did not return a category tree ID for " + marketplace + ".");
 
   const suggestionsPayload = await taxonomyFetch(
     env,
-    "/commerce/taxonomy/v1/category_tree/" +
-      encodeURIComponent(treeId) +
-      "/get_category_suggestions?q=" +
-      encodeURIComponent(q)
+    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_category_suggestions?q=" + encodeURIComponent(q)
   );
-
-  const rawSuggestions = Array.isArray(suggestionsPayload?.categorySuggestions)
-    ? suggestionsPayload.categorySuggestions
-    : [];
-
-  const suggestions = rawSuggestions.slice(0, 10).map((s, index) => ({
-    rank: index + 1,
+  const rawSuggestions = Array.isArray(suggestionsPayload?.categorySuggestions) ? suggestionsPayload.categorySuggestions : [];
+  const suggestions = rawSuggestions.slice(0, 5).map(s => ({
     categoryId: String(s?.category?.categoryId || ""),
     categoryName: String(s?.category?.categoryName || ""),
     ancestors: Array.isArray(s?.categoryTreeNodeAncestors)
-      ? s.categoryTreeNodeAncestors
-          .map(a => String(a?.categoryName || a?.category?.categoryName || ""))
-          .filter(Boolean)
+      ? s.categoryTreeNodeAncestors.map(a => String(a?.categoryName || a?.category?.categoryName || "")).filter(Boolean)
       : []
   })).filter(s => s.categoryId);
-
-  if (!suggestions.length) {
-    return json({
-      ok: false,
-      error: "no_category_suggestion",
-      message: "eBay returned no category suggestion for this item.",
-      query: q
-    }, 422);
-  }
-
-  const category = suggestions
-    .map(s => ({ ...s, gengrailScore: scoreCategorySuggestion(s, q) }))
-    .sort((a, b) => (b.gengrailScore - a.gengrailScore) || (a.rank - b.rank))[0];
+  const category = suggestions[0] || null;
+  if (!category) return json({ ok: false, error: "no_category_suggestion", message: "eBay returned no category suggestion for this item.", query: q }, 422);
 
   const aspectPayload = await taxonomyFetch(
     env,
-    "/commerce/taxonomy/v1/category_tree/" +
-      encodeURIComponent(treeId) +
-      "/get_item_aspects_for_category?category_id=" +
-      encodeURIComponent(category.categoryId)
+    "/commerce/taxonomy/v1/category_tree/" + encodeURIComponent(treeId) + "/get_item_aspects_for_category?category_id=" + encodeURIComponent(category.categoryId)
   );
-
   const allAspects = Array.isArray(aspectPayload?.aspects) ? aspectPayload.aspects : [];
-  const requiredAspects = allAspects
-    .filter(a => a?.aspectConstraint?.aspectRequired === true)
-    .map(a => ({
-      name: String(a?.localizedAspectName || ""),
-      mode: String(a?.aspectConstraint?.aspectMode || ""),
-      values: Array.isArray(a?.aspectValues)
-        ? a.aspectValues.slice(0, 100)
-            .map(v => String(v?.localizedValue || ""))
-            .filter(Boolean)
-        : []
-    }))
-    .filter(a => a.name);
+  const requiredAspects = allAspects.filter(a => a?.aspectConstraint?.aspectRequired === true).map(a => ({
+    name: String(a?.localizedAspectName || ""),
+    mode: String(a?.aspectConstraint?.aspectMode || ""),
+    values: Array.isArray(a?.aspectValues) ? a.aspectValues.slice(0, 100).map(v => String(v?.localizedValue || "")).filter(Boolean) : []
+  })).filter(a => a.name);
 
   const filter = encodeURIComponent("categoryIds:{" + category.categoryId + "}");
   const conditionResult = await ebayFetch(
     env,
-    "/sell/metadata/v1/marketplace/" +
-      encodeURIComponent(marketplace) +
-      "/get_item_condition_policies?filter=" +
-      filter
+    "/sell/metadata/v1/marketplace/" + encodeURIComponent(marketplace) + "/get_item_condition_policies?filter=" + filter
   );
-
-  if (!conditionResult.ok) {
-    return json({
-      ok: false,
-      error: "condition_metadata_failed",
-      message: "eBay Metadata API did not return condition policy data.",
-      status: conditionResult.status,
-      data: conditionResult.data,
-      category
-    }, conditionResult.status || 502);
-  }
-
-  const conditionPayload = conditionResult.data || {};
-  const policies = Array.isArray(conditionPayload?.itemConditionPolicies)
-    ? conditionPayload.itemConditionPolicies
-    : [];
-  const conditionPolicy =
-    policies.find(p => String(p?.categoryId || "") === category.categoryId) ||
-    policies[0] ||
-    null;
-
-  const condition = resolveConditionMetadata(conditionPolicy, conditionApi);
+  const conditionPayload = conditionResult?.data || {};
+  const policies = Array.isArray(conditionPayload?.itemConditionPolicies) ? conditionPayload.itemConditionPolicies : [];
+  const conditionPolicy = policies.find(p => String(p?.categoryId || "") === category.categoryId) || policies[0] || null;
 
   return json({
     ok: true,
-    engine: "gengrail-listing-resolver-v1",
     marketplace,
     query: q,
     categoryTreeId: treeId,
-    category: {
-      categoryId: category.categoryId,
-      categoryName: category.categoryName,
-      ancestors: category.ancestors,
-      sourceRank: category.rank,
-      gengrailScore: category.gengrailScore
-    },
+    category,
     suggestions,
     requiredAspects,
+    conditionPolicy
+  });
+}
+
+
+async function handleUploadImage(request, env) {
+  let incoming;
+  try {
+    incoming = await request.formData();
+  } catch {
+    return json({ ok:false, error:"invalid_form_data", message:"Image upload must use multipart/form-data." }, 400);
+  }
+
+  const image = incoming.get("image");
+  if (!(image instanceof File)) {
+    return json({ ok:false, error:"image_required", message:"An image file is required." }, 400);
+  }
+
+  if (!String(image.type || "").startsWith("image/")) {
+    return json({ ok:false, error:"invalid_image_type", message:"The uploaded file is not an image." }, 400);
+  }
+
+  // Media API image methods use the application access token.
+  const token = await getAppAccessToken(env);
+  const form = new FormData();
+  form.set("image", image, image.name || "gengrail-card.jpg");
+
+  const res = await fetch(EBAY_MEDIA_API + "/image/create_image_from_file", {
+    method: "POST",
+    headers: {
+      "authorization": "Bearer " + token,
+      "accept": "application/json"
+    },
+    body: form
+  });
+
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = { raw:text }; }
+  }
+
+  if (!res.ok) {
+    return json({
+      ok:false,
+      error:"ebay_image_upload_failed",
+      status:res.status,
+      message:"eBay Picture Services rejected the image upload.",
+      data
+    }, res.status || 502);
+  }
+
+  const location = res.headers.get("location") || "";
+  const imageId = location ? location.split("/").filter(Boolean).pop() : "";
+  const imageUrl = String(data?.imageUrl || data?.maxDimensionImageUrl || "");
+
+  if (!imageUrl) {
+    return json({
+      ok:false,
+      error:"ebay_image_url_missing",
+      message:"eBay accepted the image but did not return an EPS image URL.",
+      imageId,
+      data
+    }, 502);
+  }
+
+  return json({
+    ok:true,
+    imageId,
+    imageUrl,
+    maxDimensionImageUrl:String(data?.maxDimensionImageUrl || ""),
+    expirationDate:data?.expirationDate || null
+  });
+}
+
+function cleanAspectMap(aspects) {
+  const out = {};
+  if (!aspects || typeof aspects !== "object") return out;
+  for (const [name, raw] of Object.entries(aspects)) {
+    const key = String(name || "").trim();
+    if (!key) continue;
+    const values = (Array.isArray(raw) ? raw : [raw])
+      .map(v => String(v || "").trim())
+      .filter(Boolean);
+    if (values.length) out[key] = values;
+  }
+  return out;
+}
+
+async function handlePrepareListing(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok:false, error:"invalid_json", message:"Request body must be valid JSON." }, 400);
+  }
+
+  const sku = String(body?.sku || "").trim();
+  const categoryId = String(body?.categoryId || "").trim();
+  const title = String(body?.title || "").trim().slice(0, 80);
+  const description = String(body?.description || "").trim();
+  const condition = String(body?.condition || "").trim();
+  const quantity = Math.max(1, Math.floor(Number(body?.quantity || 1)));
+  const imageUrls = Array.isArray(body?.imageUrls)
+    ? body.imageUrls.map(x => String(x || "").trim()).filter(Boolean)
+    : [];
+  const aspects = cleanAspectMap(body?.aspects);
+
+  const settings = body?.settings || {};
+  const marketplaceId = String(settings.marketplaceId || "EBAY_GB");
+  const merchantLocationKey = String(settings.merchantLocationKey || "").trim();
+  const paymentPolicyId = String(settings.paymentPolicyId || "").trim();
+  const fulfillmentPolicyId = String(settings.fulfillmentPolicyId || "").trim();
+  const returnPolicyId = String(settings.returnPolicyId || "").trim();
+  const currency = String(settings.currency || "GBP").trim();
+  const format = String(settings.format || "FIXED_PRICE").trim();
+  const listingDuration = String(settings.listingDuration || "GTC").trim();
+  const price = Number(body?.price || 0);
+
+  const missing = [];
+  if (!sku) missing.push("sku");
+  if (!categoryId) missing.push("categoryId");
+  if (!title) missing.push("title");
+  if (!description) missing.push("description");
+  if (!condition) missing.push("condition");
+  if (!Object.keys(aspects).length) missing.push("aspects");
+  if (!imageUrls.length) missing.push("imageUrls");
+  if (!(price > 0)) missing.push("price");
+  if (!merchantLocationKey) missing.push("merchantLocationKey");
+  if (!paymentPolicyId) missing.push("paymentPolicyId");
+  if (!fulfillmentPolicyId) missing.push("fulfillmentPolicyId");
+  if (!returnPolicyId) missing.push("returnPolicyId");
+
+  if (missing.length) {
+    return json({
+      ok:false,
+      error:"listing_not_ready",
+      message:"The listing is missing required publishing data.",
+      missing
+    }, 400);
+  }
+
+  const conditionDescriptors = [];
+  const descriptorName = String(body?.conditionDescriptorName || "").trim();
+  const descriptorValue = String(body?.conditionDescriptorValue || "").trim();
+  if (descriptorName && descriptorValue) {
+    conditionDescriptors.push({
+      name: descriptorName,
+      values: [descriptorValue]
+    });
+  }
+
+  const inventoryPayload = {
+    availability: {
+      shipToLocationAvailability: { quantity }
+    },
     condition,
-    ready: Boolean(
-      category.categoryId &&
-      (
-        condition.descriptorRequired === false ||
-        (condition.descriptorNameId && condition.descriptorValueId)
-      )
-    )
+    ...(conditionDescriptors.length ? { conditionDescriptors } : {}),
+    product: {
+      title,
+      description,
+      aspects,
+      imageUrls
+    }
+  };
+
+  const inventory = await ebayFetch(
+    env,
+    "/sell/inventory/v1/inventory_item/" + encodeURIComponent(sku),
+    { method:"PUT", body:JSON.stringify(inventoryPayload) }
+  );
+
+  if (!inventory.ok) {
+    return json({
+      ok:false,
+      stage:"inventory_item",
+      error:"inventory_item_failed",
+      status:inventory.status,
+      message:"eBay rejected the inventory item.",
+      data:inventory.data
+    }, inventory.status || 502);
+  }
+
+  const offerPayload = {
+    sku,
+    marketplaceId,
+    format,
+    categoryId,
+    availableQuantity: quantity,
+    merchantLocationKey,
+    listingPolicies: {
+      paymentPolicyId,
+      fulfillmentPolicyId,
+      returnPolicyId
+    },
+    pricingSummary: {
+      price: {
+        value: price.toFixed(2),
+        currency
+      }
+    },
+    listingDuration
+  };
+
+  let offer;
+  const existingOfferId = String(body?.offerId || "").trim();
+  if (existingOfferId) {
+    offer = await ebayFetch(
+      env,
+      "/sell/inventory/v1/offer/" + encodeURIComponent(existingOfferId),
+      { method:"PUT", body:JSON.stringify(offerPayload) }
+    );
+    if (!offer.ok) {
+      return json({
+        ok:false,
+        stage:"offer_update",
+        error:"offer_update_failed",
+        status:offer.status,
+        message:"The inventory item was accepted, but eBay rejected the existing offer update.",
+        data:offer.data
+      }, offer.status || 502);
+    }
+    return json({
+      ok:true,
+      prepared:true,
+      sku,
+      offerId:existingOfferId,
+      inventoryStatus:inventory.status,
+      offerStatus:offer.status,
+      imageUrls
+    });
+  }
+
+  offer = await ebayFetch(
+    env,
+    "/sell/inventory/v1/offer",
+    { method:"POST", body:JSON.stringify(offerPayload) }
+  );
+
+  if (!offer.ok) {
+    return json({
+      ok:false,
+      stage:"offer_create",
+      error:"offer_create_failed",
+      status:offer.status,
+      message:"The inventory item was accepted, but eBay rejected the offer.",
+      data:offer.data
+    }, offer.status || 502);
+  }
+
+  const offerId = String(offer?.data?.offerId || "");
+  if (!offerId) {
+    return json({
+      ok:false,
+      stage:"offer_create",
+      error:"offer_id_missing",
+      message:"eBay accepted the offer but did not return an offerId.",
+      data:offer.data
+    }, 502);
+  }
+
+  return json({
+    ok:true,
+    prepared:true,
+    sku,
+    offerId,
+    inventoryStatus:inventory.status,
+    offerStatus:offer.status,
+    imageUrls
+  });
+}
+
+async function handlePublishListing(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok:false, error:"invalid_json", message:"Request body must be valid JSON." }, 400);
+  }
+
+  const offerId = String(body?.offerId || "").trim();
+  if (!offerId) {
+    return json({ ok:false, error:"offer_id_required", message:"offerId is required." }, 400);
+  }
+
+  const published = await ebayFetch(
+    env,
+    "/sell/inventory/v1/offer/" + encodeURIComponent(offerId) + "/publish",
+    { method:"POST" }
+  );
+
+  if (!published.ok) {
+    return json({
+      ok:false,
+      stage:"publish",
+      error:"publish_failed",
+      status:published.status,
+      message:"eBay rejected the publish request.",
+      data:published.data
+    }, published.status || 502);
+  }
+
+  const listingId = String(published?.data?.listingId || "");
+  return json({
+    ok:true,
+    published:true,
+    offerId,
+    listingId,
+    data:published.data
   });
 }
 
@@ -755,6 +791,12 @@ export default {
         response = await handlePolicies(env);
       } else if (url.pathname === "/api/ebay/resolve-listing" && request.method === "GET") {
         response = await handleResolveListing(request, env);
+      } else if (url.pathname === "/api/ebay/media/image" && request.method === "POST") {
+        response = await handleUploadImage(request, env);
+      } else if (url.pathname === "/api/ebay/listing/prepare" && request.method === "POST") {
+        response = await handlePrepareListing(request, env);
+      } else if (url.pathname === "/api/ebay/listing/publish" && request.method === "POST") {
+        response = await handlePublishListing(request, env);
       } else if (url.pathname === "/api/ebay/inventory-locations" && request.method === "GET") {
         response = await handleInventoryLocations(env);
       } else if (url.pathname === "/api/ebay/inventory-location" && request.method === "POST") {
