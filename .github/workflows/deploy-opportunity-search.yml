@@ -1,0 +1,57 @@
+name: Deploy opportunity search
+
+on:
+  push:
+    branches:
+      - agent/graded-market-v1
+    paths:
+      - scripts/add_opportunity_search_route.py
+      - .github/workflows/deploy-opportunity-search.yml
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout opportunity branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/graded-market-v1
+          fetch-depth: 20
+
+      - name: Apply additive opportunity route
+        run: python3 scripts/add_opportunity_search_route.py
+
+      - name: Verify additive backend change
+        run: |
+          git fetch origin main --depth=1
+          grep -q 'async function handleGradedMarket' worker.js
+          grep -q '/api/ebay/graded-market' worker.js
+          grep -q 'async function handleOpportunitySearch' worker.js
+          grep -q '/api/ebay/opportunities/search' worker.js
+          grep -q '"name": "gengrail-ebay-backend"' wrangler.jsonc
+          grep -q '"keep_vars": true' wrangler.jsonc
+          git diff --exit-code origin/main -- wrangler.jsonc
+
+      - name: Commit generated worker route
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add worker.js
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add read-only live opportunity search route'
+            git push origin HEAD:agent/graded-market-v1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy live eBay backend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 deploy --config wrangler.jsonc
