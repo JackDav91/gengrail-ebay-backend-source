@@ -14,126 +14,26 @@ jobs:
   patch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: agent/graded-market-v1
-
-      - name: Add read-only Browse market route
+      - name: Patch worker
         run: |
           cp worker.js /tmp/worker-before.js
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('worker.js')
-          s=p.read_text()
-          marker='async function handleOrders(request, env) {'
-          if marker not in s: raise SystemExit('handleOrders marker missing')
-          block=r'''
-async function browseFetch(env, path) {
-  const token = await getAppAccessToken(env);
-  const res = await fetch(EBAY_API + path, {
-    method: "GET",
-    headers: {
-      "authorization": "Bearer " + token,
-      "accept": "application/json",
-      "accept-language": "en-GB",
-      "x-ebay-c-marketplace-id": "EBAY_GB"
-    }
-  });
-  const text = await res.text();
-  let data = null;
-  if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
-  return { ok: res.ok, status: res.status, data };
-}
-
-async function handleGradedMarket(request, env) {
-  let body;
-  try { body = await request.json(); }
-  catch { return json({ ok:false, error:"invalid_json", message:"Request body must be valid JSON." }, 400); }
-
-  const cardName = String(body?.cardName || "").trim();
-  const cardNumber = String(body?.cardNumber || "").trim();
-  const grader = String(body?.grader || "").trim();
-  const grade = String(body?.grade || "").trim();
-  const setName = String(body?.setName || "").trim();
-  const language = String(body?.language || "").trim();
-  const missing = [];
-  if (!cardName) missing.push("cardName");
-  if (!cardNumber) missing.push("cardNumber");
-  if (!grader) missing.push("grader");
-  if (!grade) missing.push("grade");
-  if (missing.length) return json({ ok:false, error:"graded_identity_required", missing }, 400);
-
-  const query = [cardName, cardNumber, grader, grade, language, "Pokemon"].filter(Boolean).join(" ");
-  const params = new URLSearchParams();
-  params.set("q", query);
-  params.set("limit", "50");
-  params.set("filter", "buyingOptions:{FIXED_PRICE}");
-  const ebay = await browseFetch(env, "/buy/browse/v1/item_summary/search?" + params.toString());
-  if (!ebay.ok) {
-    return json({
-      ok:false,
-      error:"ebay_browse_failed",
-      status:ebay.status,
-      message:"eBay current-listing search failed.",
-      data:ebay.data
-    }, ebay.status || 502);
-  }
-
-  const itemSummaries = Array.isArray(ebay.data?.itemSummaries) ? ebay.data.itemSummaries.map(x => ({
-    itemId: String(x?.itemId || ""),
-    title: String(x?.title || ""),
-    price: x?.price || null,
-    itemWebUrl: String(x?.itemWebUrl || ""),
-    condition: String(x?.condition || ""),
-    buyingOptions: Array.isArray(x?.buyingOptions) ? x.buyingOptions : [],
-    seller: x?.seller ? { username: String(x.seller.username || ""), feedbackPercentage: String(x.seller.feedbackPercentage || "") } : null,
-    image: x?.image?.imageUrl ? { imageUrl: String(x.image.imageUrl) } : null,
-    itemLocation: x?.itemLocation || null
-  })) : [];
-
-  return json({
-    ok:true,
-    source:"eBay Browse API · active EBAY_GB listings",
-    evidenceType:"current_active_asking_prices",
-    query,
-    identity:{ cardName, cardNumber, setName, language, grader, grade },
-    total:Number(ebay.data?.total || itemSummaries.length || 0),
-    itemSummaries
-  });
-}
-
-'''
-          if 'async function handleGradedMarket(' in s: raise SystemExit('graded route already exists')
-          s=s.replace(marker,block+marker,1)
-          route_marker='} else if (url.pathname === "/api/ebay/status" && request.method === "GET") {'
-          if route_marker not in s: raise SystemExit('router marker missing')
-          route='''} else if (url.pathname === "/api/ebay/graded-market" && request.method === "POST") {\n        response = await handleGradedMarket(request, env);\n      '''
-          s=s.replace(route_marker,route+route_marker,1)
-          p.write_text(s)
-          PY
-
-      - name: Verify additive safety boundary
+          python3 scripts/patch-graded-market.py
+      - name: Verify additive route only
         run: |
           python3 - <<'PY'
           from pathlib import Path
           before=Path('/tmp/worker-before.js').read_text()
           after=Path('worker.js').read_text()
-          required=[
-            'async function handleGradedMarket(request, env)',
-            '/api/ebay/graded-market',
-            '/buy/browse/v1/item_summary/search?',
-            'getAppAccessToken(env)'
-          ]
-          for x in required:
-            if x not in after: raise SystemExit('Missing expected graded route marker: '+x)
-          # Existing seller routes must remain present.
+          for x in ['async function handleGradedMarket(request, env)','/api/ebay/graded-market','/buy/browse/v1/item_summary/search?','getAppAccessToken(env)']:
+              if x not in after: raise SystemExit('Missing '+x)
           for x in ['/api/ebay/status','/api/ebay/policies','/api/ebay/orders','/api/ebay/disconnect','/oauth/start','/ebay/callback']:
-            if x not in after: raise SystemExit('Existing route missing: '+x)
+              if x not in after: raise SystemExit('Existing route missing '+x)
           if len(after) <= len(before): raise SystemExit('Patch was not additive')
           PY
-
-      - name: Commit branch patch
+      - name: Commit worker patch
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
