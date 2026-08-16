@@ -1019,6 +1019,74 @@ async function handlePublishListing(request, env) {
   });
 }
 
+async function browseFetch(env, path) {
+  const token = await getAppAccessToken(env);
+  const res = await fetch(EBAY_API + path, {
+    method: "GET",
+    headers: {
+      "authorization": "Bearer " + token,
+      "accept": "application/json",
+      "accept-language": "en-GB",
+      "x-ebay-c-marketplace-id": "EBAY_GB"
+    }
+  });
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function handleGradedMarket(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ ok:false, error:"invalid_json", message:"Request body must be valid JSON." }, 400); }
+
+  const cardName = String(body?.cardName || "").trim();
+  const cardNumber = String(body?.cardNumber || "").trim();
+  const grader = String(body?.grader || "").trim();
+  const grade = String(body?.grade || "").trim();
+  const setName = String(body?.setName || "").trim();
+  const language = String(body?.language || "").trim();
+  const missing = [];
+  if (!cardName) missing.push("cardName");
+  if (!cardNumber) missing.push("cardNumber");
+  if (!grader) missing.push("grader");
+  if (!grade) missing.push("grade");
+  if (missing.length) return json({ ok:false, error:"graded_identity_required", missing }, 400);
+
+  const query = [cardName, cardNumber, grader, grade, language, "Pokemon"].filter(Boolean).join(" ");
+  const params = new URLSearchParams();
+  params.set("q", query);
+  params.set("limit", "50");
+  params.set("filter", "buyingOptions:{FIXED_PRICE}");
+  const ebay = await browseFetch(env, "/buy/browse/v1/item_summary/search?" + params.toString());
+  if (!ebay.ok) {
+    return json({ ok:false, error:"ebay_browse_failed", status:ebay.status, message:"eBay current-listing search failed.", data:ebay.data }, ebay.status || 502);
+  }
+
+  const itemSummaries = Array.isArray(ebay.data?.itemSummaries) ? ebay.data.itemSummaries.map(x => ({
+    itemId: String(x?.itemId || ""),
+    title: String(x?.title || ""),
+    price: x?.price || null,
+    itemWebUrl: String(x?.itemWebUrl || ""),
+    condition: String(x?.condition || ""),
+    buyingOptions: Array.isArray(x?.buyingOptions) ? x.buyingOptions : [],
+    seller: x?.seller ? { username: String(x.seller.username || ""), feedbackPercentage: String(x.seller.feedbackPercentage || "") } : null,
+    image: x?.image?.imageUrl ? { imageUrl: String(x.image.imageUrl) } : null,
+    itemLocation: x?.itemLocation || null
+  })) : [];
+
+  return json({
+    ok:true,
+    source:"eBay Browse API · active EBAY_GB listings",
+    evidenceType:"current_active_asking_prices",
+    query,
+    identity:{ cardName, cardNumber, setName, language, grader, grade },
+    total:Number(ebay.data?.total || itemSummaries.length || 0),
+    itemSummaries
+  });
+}
+
 async function handleOrders(request, env) {
   const url = new URL(request.url);
   const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
@@ -1062,6 +1130,8 @@ export default {
         return handleStart(request, env);
       } else if (url.pathname === "/ebay/callback" && request.method === "GET") {
         return handleCallback(request, env);
+      } else if (url.pathname === "/api/ebay/graded-market" && request.method === "POST") {
+        response = await handleGradedMarket(request, env);
       } else if (url.pathname === "/api/ebay/status" && request.method === "GET") {
         response = await handleStatus(env);
       } else if (url.pathname === "/api/ebay/policies" && request.method === "GET") {
