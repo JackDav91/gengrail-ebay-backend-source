@@ -1,0 +1,42 @@
+name: Deploy graded market route
+
+on:
+  push:
+    branches:
+      - agent/graded-market-v1
+    paths:
+      - .github/workflows/deploy-graded-market.yml
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout graded market branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/graded-market-v1
+
+      - name: Verify production target and additive worker diff
+        run: |
+          git fetch origin main --depth=1
+          grep -q '"name": "gengrail-ebay-backend"' wrangler.jsonc
+          grep -q '"keep_vars": true' wrangler.jsonc
+          git diff --exit-code origin/main -- wrangler.jsonc
+          python3 - <<'PY'
+          import subprocess
+          diff=subprocess.check_output(['git','diff','--numstat','origin/main','--','worker.js'],text=True).strip().split('\t')
+          if len(diff)!=3: raise SystemExit('worker.js diff missing')
+          adds,dels,_=diff
+          if int(adds)<=0 or int(dels)!=0: raise SystemExit(f'Safety stop: worker diff must be additive only, got +{adds}/-{dels}')
+          PY
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy live eBay backend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 deploy --config wrangler.jsonc
